@@ -1,0 +1,72 @@
+name: Dashboard image verification
+on:
+  push:
+    branches: [hd-creatives-v4]
+    paths: ['.github/workflows/dashboard-check.yml', 'tools/check_dashboard.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install browser and image decoders
+        run: |
+          python -m pip install --quiet pillow playwright
+          python -m playwright install --with-deps chromium
+      - name: Inspect the currently published dashboard
+        run: |
+          mkdir -p diagnostics/sources
+          cp -r imgdata-hd assets pl*.js pl*.css pl*.html pl*.json diagnostics/sources/
+          python - <<'PY'
+          import base64, io, json, pathlib
+          from PIL import Image
+          from playwright.sync_api import sync_playwright
+          out = pathlib.Path('diagnostics')
+          report = {'images': {}, 'browser_errors': [], 'downloads': {}}
+          for day in ['monday','wednesday','friday']:
+              paths = sorted(pathlib.Path('imgdata-hd').glob(day+'-*.txt'))
+              text = ''.join(p.read_text().strip() for p in paths)
+              entry = {'parts':[(p.name,p.stat().st_size) for p in paths], 'base64_length':len(text)}
+              try:
+                  data=base64.b64decode(text,validate=True)
+                  (out/(day+'.avif')).write_bytes(data)
+                  im=Image.open(io.BytesIO(data)); im.load()
+                  entry['size']=im.size
+                  im.save(out/(day+'-decoded.png'))
+              except Exception as e:
+                  entry['error']=str(e)
+              report['images'][day]=entry
+          with sync_playwright() as p:
+              browser=p.chromium.launch()
+              page=browser.new_page(viewport={'width':1440,'height':1000},device_scale_factor=1,accept_downloads=True)
+              page.on('pageerror',lambda err:report['browser_errors'].append(str(err)))
+              url='https://emmanuelbarriosxcom-dev.github.io/partners-limos-dashboards/pl-rrss-07-11-sep-26.html?v=4'
+              response=page.goto(url,wait_until='networkidle',timeout=60000)
+              report['http_status']=response.status
+              page.wait_for_timeout(3000)
+              report['browser_images']=page.locator('.creative-preview img').evaluate_all('(imgs)=>imgs.map(i=>({id:i.id,width:i.naturalWidth,height:i.naturalHeight,complete:i.complete}))')
+              for day in ['monday','wednesday','friday']:
+                  page.locator('#'+day+' .creative-preview').screenshot(path=str(out/(day+'-published.png')))
+                  try:
+                      with page.expect_download(timeout=10000) as event:
+                          page.locator('[data-download-creative="'+day+'"]').click()
+                      download=event.value
+                      path=out/download.suggested_filename
+                      download.save_as(str(path))
+                      im=Image.open(path); im.load()
+                      report['downloads'][day]={'filename':path.name,'dimensions':im.size,'bytes':path.stat().st_size}
+                  except Exception as e:
+                      report['downloads'][day]={'error':str(e)}
+              browser.close()
+          (out/'report.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dashboard-diagnostics
+          path: diagnostics/
+          retention-days: 3
